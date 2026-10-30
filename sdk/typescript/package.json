@@ -1,0 +1,14 @@
+{
+  "name": "@gridsight/sdk",
+  "version": "1.0.0",
+  "description": "TypeScript client for the GridSight AI REST and WebSocket APIs (zero dependencies, Node 22+ or browsers)",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "example": "npx tsx examples/quickstart.ts"
+  },
+  "devDependencies": { "typescript": "~5.6.3" }
+}

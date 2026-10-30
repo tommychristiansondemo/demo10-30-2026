@@ -1,0 +1,13 @@
+node_modules/
+dist/
+cdk.out/
+infra/cdk-outputs-*.json
+infra/cdk.context.json
+web/public/config.json
+web/public/openapi.yaml
+services/sample/
+*.log
+.DS_Store
+__pycache__/
+*.egg-info/
+.env*

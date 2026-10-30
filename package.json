@@ -1,0 +1,27 @@
+{
+  "name": "gridsight-ai",
+  "private": true,
+  "version": "1.0.0",
+  "description": "GridSight AI: grid operations intelligence platform for ERCOT-style markets",
+  "workspaces": [
+    "services",
+    "insights",
+    "infra",
+    "web",
+    "sdk/typescript"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "npm run build -w services && npm run build -w web && npm run build -w insights && npm run build -w sdk/typescript",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm test -w services && npm test -w insights",
+    "lint": "npm run typecheck",
+    "synth": "npm run synth -w infra --",
+    "deploy:dev": "npm run build -w web && npm run build -w insights && npm run deploy -w infra -- -c env=dev --all --require-approval never",
+    "deploy:prod": "npm run build -w web && npm run build -w insights && npm run deploy -w infra -- -c env=prod --all",
+    "destroy:dev": "npm run destroy -w infra -- -c env=dev --all",
+    "generate:sample": "npm run generate:sample -w services"
+  }
+}

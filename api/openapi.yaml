@@ -1,0 +1,452 @@
+openapi: 3.0.3
+info:
+  title: GridSight AI API
+  version: 1.0.0
+  description: |
+    REST API for GridSight AI, a grid operations intelligence platform for ERCOT-style markets.
+    **All grid data is synthetic.**
+
+    **Authentication:** send a Cognito *access token* as `Authorization: Bearer <token>`.
+    Get one from the Developers page or with `aws cognito-idp initiate-auth` using the CLI app client.
+
+    **Roles** (Cognito groups, each includes the ones below it): `Viewer` < `Analyst` < `Operator` < `Admin`.
+    The minimum role is listed on each operation as `x-required-role`.
+
+    **Streaming chat** uses the WebSocket API at `wss://<api-host>/ws?token=<access token>`:
+    send `{"action":"chat","requestId":"<uuid>","message":"...","sessionId":"<optional uuid>"}` and receive
+    `chat.accepted`, `chat.tool`, `chat.delta`, `chat.done` or `chat.error` frames. All clients also receive
+    `grid.interval` (every 5 minutes), `alert.new` and `alert.updated` broadcasts.
+servers:
+  - url: https://api.gridsight.awsteach.com
+    description: prod
+  - url: https://api.dev.gridsight.awsteach.com
+    description: dev
+security:
+  - cognito: []
+tags:
+  - name: Grid
+  - name: Analytics
+  - name: Alerts
+  - name: AI
+  - name: Query
+  - name: Admin
+paths:
+  /v1/health:
+    get:
+      tags: [Grid]
+      summary: Health check
+      security: []
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object, properties: { status: { type: string }, env: { type: string }, time: { type: string, format: date-time } } } } } }
+  /v1/me:
+    get:
+      tags: [Grid]
+      summary: Current user, effective role and public feature flags
+      x-required-role: Viewer
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Me' } } } }
+        '401': { $ref: '#/components/responses/Error' }
+  /v1/grid/current:
+    get:
+      tags: [Grid]
+      summary: Latest 5-minute interval with derived status and active events
+      x-required-role: Viewer
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Snapshot' } } } }
+        '503': { $ref: '#/components/responses/Error' }
+  /v1/grid/series:
+    get:
+      tags: [Grid]
+      summary: Time series from the real-time store (max 31 days)
+      x-required-role: Viewer
+      parameters:
+        - { name: start, in: query, schema: { type: string, format: date-time }, description: Defaults to 24 hours ago }
+        - { name: end, in: query, schema: { type: string, format: date-time }, description: Defaults to now }
+        - { name: resolution, in: query, schema: { type: string, enum: ['5m', '1h'] }, description: Defaults to 5m for ranges up to 48 h, otherwise 1h }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  resolution: { type: string, enum: ['5m', '1h'] }
+                  points: { type: array, items: { $ref: '#/components/schemas/GridInterval' } }
+        '400': { $ref: '#/components/responses/Error' }
+  /v1/grid/events:
+    get:
+      tags: [Grid]
+      summary: Contingency and data-quality events
+      x-required-role: Viewer
+      parameters:
+        - { name: start, in: query, schema: { type: string, format: date-time } }
+        - { name: end, in: query, schema: { type: string, format: date-time } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object, properties: { events: { type: array, items: { $ref: '#/components/schemas/GridEvent' } } } } } } }
+  /v1/forecast/load:
+    get:
+      tags: [Analytics]
+      summary: Hourly load forecast with P10/P90 bands and backtest accuracy
+      x-required-role: Analyst
+      parameters:
+        - { name: hours, in: query, schema: { type: integer, minimum: 1, maximum: 72, default: 48 } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Forecast' } } } }
+        '503': { $ref: '#/components/responses/Error' }
+  /v1/anomalies:
+    get:
+      tags: [Analytics]
+      summary: Run anomaly detectors on demand over recent data
+      x-required-role: Analyst
+      parameters:
+        - { name: hours, in: query, schema: { type: integer, minimum: 1, maximum: 72, default: 24 } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  window_hours: { type: integer }
+                  intervals_scanned: { type: integer }
+                  anomalies: { type: array, items: { $ref: '#/components/schemas/Anomaly' } }
+  /v1/alerts:
+    get:
+      tags: [Alerts]
+      summary: List alerts by status (newest first)
+      x-required-role: Viewer
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [OPEN, ACKNOWLEDGED, RESOLVED], default: OPEN } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 500, default: 100 } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object, properties: { alerts: { type: array, items: { $ref: '#/components/schemas/Alert' } } } } } } }
+    post:
+      tags: [Alerts]
+      summary: Create a manual alert
+      x-required-role: Operator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title, message, severity]
+              properties:
+                title: { type: string, maxLength: 200 }
+                message: { type: string, maxLength: 4000 }
+                severity: { type: string, enum: [INFO, WARNING, CRITICAL] }
+                zone: { type: string }
+      responses:
+        '200': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Alert' } } } }
+        '403': { $ref: '#/components/responses/Error' }
+  /v1/alerts/{id}/ack:
+    post:
+      tags: [Alerts]
+      summary: Acknowledge an alert
+      x-required-role: Operator
+      parameters: [{ $ref: '#/components/parameters/AlertId' }]
+      requestBody: { $ref: '#/components/requestBodies/Note' }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Alert' } } } }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+  /v1/alerts/{id}/resolve:
+    post:
+      tags: [Alerts]
+      summary: Resolve an alert
+      x-required-role: Operator
+      parameters: [{ $ref: '#/components/parameters/AlertId' }]
+      requestBody: { $ref: '#/components/requestBodies/Note' }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Alert' } } } }
+        '404': { $ref: '#/components/responses/Error' }
+  /v1/ai/ask:
+    post:
+      tags: [AI]
+      summary: Ask the AI assistant (synchronous, max 3 tool iterations; use WebSocket for streaming)
+      x-required-role: Analyst
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message]
+              properties:
+                message: { type: string, maxLength: 8000 }
+                sessionId: { type: string, format: uuid, description: Continue an existing conversation }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sessionId: { type: string, format: uuid }
+                  turn: { type: integer }
+                  answer: { type: string, description: Markdown }
+                  model: { type: string }
+                  tools: { type: array, items: { $ref: '#/components/schemas/ToolTrace' } }
+                  usage: { type: object, additionalProperties: { type: integer } }
+        '503': { $ref: '#/components/responses/Error' }
+  /v1/ai/sessions:
+    get:
+      tags: [AI]
+      summary: List your conversations
+      x-required-role: Analyst
+      responses:
+        '200': { description: OK }
+  /v1/ai/sessions/{id}:
+    get:
+      tags: [AI]
+      summary: Get a conversation transcript
+      x-required-role: Analyst
+      parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses:
+        '200': { description: OK }
+        '404': { $ref: '#/components/responses/Error' }
+  /v1/ai/sql:
+    post:
+      tags: [AI, Query]
+      summary: Translate a question into Athena SQL and (optionally) run it
+      x-required-role: Analyst
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [question]
+              properties:
+                question: { type: string, maxLength: 2000 }
+                execute: { type: boolean, default: true }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  question: { type: string }
+                  sql: { type: string }
+                  explanation: { type: string }
+                  result: { $ref: '#/components/schemas/QueryResult' }
+                  error: { type: string }
+  /v1/query/sql:
+    post:
+      tags: [Query]
+      summary: Run a read-only SELECT against the data lake (Athena)
+      description: Single SELECT/WITH statement; only GridSight tables; no comments; LIMIT enforced; per-query scan limit enforced by the Athena workgroup.
+      x-required-role: Analyst
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sql]
+              properties:
+                sql: { type: string, example: "SELECT dt, max(load_mw) AS peak FROM grid_interval WHERE dt >= '2026-10-01' GROUP BY dt ORDER BY dt" }
+                maxRows: { type: integer, minimum: 1, maximum: 10000, default: 1000 }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/QueryResult' } } } }
+        '400': { $ref: '#/components/responses/Error' }
+  /v1/kb/search:
+    get:
+      tags: [AI]
+      summary: Semantic search over the operational knowledge base
+      x-required-role: Analyst
+      parameters:
+        - { name: q, in: query, required: true, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 10, default: 5 } }
+      responses:
+        '200': { description: OK }
+  /v1/admin/config:
+    get:
+      tags: [Admin]
+      summary: Get runtime configuration (feature flags, model IDs, detector thresholds)
+      x-required-role: Admin
+      responses:
+        '200': { description: OK }
+    put:
+      tags: [Admin]
+      summary: Replace runtime configuration (validated; versioned in SSM; audited)
+      x-required-role: Admin
+      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      responses:
+        '200': { description: OK }
+        '400': { $ref: '#/components/responses/Error' }
+  /v1/admin/audit:
+    get:
+      tags: [Admin]
+      summary: Audit events for a day
+      x-required-role: Admin
+      parameters:
+        - { name: date, in: query, schema: { type: string, format: date } }
+        - { name: actor, in: query, schema: { type: string }, description: Cognito sub }
+        - { name: limit, in: query, schema: { type: integer, maximum: 1000 } }
+      responses:
+        '200': { description: OK }
+  /v1/admin/users:
+    get:
+      tags: [Admin]
+      summary: List users and their groups
+      x-required-role: Admin
+      responses:
+        '200': { description: OK }
+  /v1/admin/users/{username}/role:
+    put:
+      tags: [Admin]
+      summary: Set a user's role
+      x-required-role: Admin
+      parameters: [{ name: username, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [role], properties: { role: { type: string, enum: [Viewer, Analyst, Operator, Admin] } } } } }
+      responses:
+        '200': { description: OK }
+components:
+  securitySchemes:
+    cognito:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Cognito user pool access token
+  parameters:
+    AlertId: { name: id, in: path, required: true, schema: { type: string }, description: URL-encoded alert id }
+  requestBodies:
+    Note:
+      content: { application/json: { schema: { type: object, properties: { note: { type: string, maxLength: 2000 } } } } }
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: object
+                properties:
+                  code: { type: string }
+                  message: { type: string }
+                  requestId: { type: string }
+                  details: {}
+  schemas:
+    Me:
+      type: object
+      properties:
+        user:
+          type: object
+          properties:
+            sub: { type: string }
+            username: { type: string }
+            email: { type: string }
+            groups: { type: array, items: { type: string } }
+            role: { type: string, enum: [Viewer, Analyst, Operator, Admin] }
+        config: { type: object }
+    GridInterval:
+      type: object
+      properties:
+        ts: { type: string, format: date-time, description: Interval end (UTC) }
+        epoch_ms: { type: integer }
+        load_mw: { type: number }
+        load_forecast_mw: { type: number }
+        net_load_mw: { type: number }
+        gen:
+          type: object
+          properties: { gas: { type: number }, coal: { type: number }, nuclear: { type: number }, wind: { type: number }, solar: { type: number }, storage: { type: number }, hydro: { type: number }, other: { type: number } }
+        gen_total_mw: { type: number }
+        curtailment_mw: { type: number }
+        freq: { type: object, properties: { mean_hz: { type: number }, min_hz: { type: number }, max_hz: { type: number } } }
+        reserves: { type: object, properties: { prc_mw: { type: number }, regup_mw: { type: number }, regdown_mw: { type: number }, rrs_mw: { type: number }, ecrs_mw: { type: number }, nonspin_mw: { type: number } } }
+        system_lambda: { type: number }
+        hubs: { type: object, additionalProperties: { type: object, properties: { lmp: { type: number }, energy: { type: number }, congestion: { type: number }, loss: { type: number } } } }
+        zones: { type: object, additionalProperties: { type: object, properties: { load_mw: { type: number }, temp_f: { type: number } } } }
+        active_events: { type: array, items: { type: string } }
+        data_quality: { type: string, enum: [GOOD, STALE] }
+    Snapshot:
+      allOf:
+        - $ref: '#/components/schemas/GridInterval'
+        - type: object
+          properties:
+            derived:
+              type: object
+              properties:
+                renewable_share_pct: { type: number }
+                reserve_status: { type: string, enum: [NORMAL, WATCH, ADVISORY, EMERGENCY] }
+                forecast_error_pct: { type: number }
+                data_age_seconds: { type: integer }
+            active_event_details: { type: array, items: { $ref: '#/components/schemas/GridEvent' } }
+    GridEvent:
+      type: object
+      properties:
+        event_id: { type: string }
+        type: { type: string, enum: [UNIT_TRIP, WIND_RAMP, TRANSMISSION_OUTAGE, TELEMETRY_STALE, LOAD_FORECAST_MISS] }
+        start: { type: string, format: date-time }
+        end: { type: string, format: date-time }
+        zone: { type: string }
+        severity: { type: string, enum: [INFO, WARNING, CRITICAL] }
+        mw_impact: { type: number }
+        description: { type: string }
+    Forecast:
+      type: object
+      properties:
+        model: { type: string }
+        issued_at: { type: string, format: date-time }
+        trained_on_hours: { type: integer }
+        backtest: { type: object, properties: { horizon_hours: { type: integer }, mape_pct: { type: number }, naive_mape_pct: { type: number } } }
+        points:
+          type: array
+          items: { type: object, properties: { ts: { type: string, format: date-time }, forecast_mw: { type: number }, p10_mw: { type: number }, p90_mw: { type: number }, temp_forecast_f: { type: number } } }
+        recent_actuals: { type: array, items: { type: object } }
+    Anomaly:
+      type: object
+      properties:
+        id: { type: string }
+        ts: { type: string, format: date-time }
+        type: { type: string, enum: [FREQUENCY_EXCURSION, LOW_RESERVES, FORECAST_DEVIATION, NET_LOAD_RAMP, STATISTICAL_OUTLIER, STALE_TELEMETRY, PRICE_SPIKE] }
+        metric: { type: string }
+        severity: { type: string }
+        value: { type: number }
+        expected: { type: number }
+        score: { type: number }
+        zone: { type: string }
+        title: { type: string }
+        message: { type: string }
+    Alert:
+      type: object
+      properties:
+        id: { type: string }
+        ts: { type: string, format: date-time }
+        type: { type: string }
+        metric: { type: string }
+        severity: { type: string, enum: [INFO, WARNING, CRITICAL] }
+        status: { type: string, enum: [OPEN, ACKNOWLEDGED, RESOLVED] }
+        title: { type: string }
+        message: { type: string }
+        value: { type: number }
+        zone: { type: string }
+        source: { type: string, enum: [detector, manual] }
+        notes: { type: array, items: { type: object, properties: { at: { type: string }, by: { type: string }, text: { type: string } } } }
+    ToolTrace:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        input: {}
+        ok: { type: boolean }
+        summary: { type: string }
+        durationMs: { type: integer }
+    QueryResult:
+      type: object
+      properties:
+        sql: { type: string, description: The SQL actually executed (after guard rewriting) }
+        columns: { type: array, items: { type: object, properties: { name: { type: string }, type: { type: string } } } }
+        rows: { type: array, items: { type: object } }
+        truncated: { type: boolean }
+        stats: { type: object, properties: { queryExecutionId: { type: string }, bytesScanned: { type: integer }, executionMs: { type: integer } } }
